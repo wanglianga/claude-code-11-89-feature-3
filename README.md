@@ -5,7 +5,10 @@
 覆盖：报修原文与归属判断、事故确认、图算法候选关阀组合与精确地址影响集合、
 班组许可/当班窗口/车辆/工具校验、队伍与阀门操作许可的并发互斥、两种稀缺队伍调度路线、
 五类现场回执的顺序约束、复压区间+校时容差核验、复压失败重新派工，以及压力复核推翻后的
-范围/资源占用/通知全链路更正。
+范围/资源占用/通知全链路更正；并实现**相邻抢修同时停水时的临时供水调度**：
+稳定住户标识去重、每户唯一取水点、诊所/安置点最低保障、按区预留与共享池两条配额路线、
+车辆罐容与取水时段/无障碍接驳、合格水源余量与水质凭证有效期、装车出库/现场签收/
+未开封退回复核的库存闭环，以及片区恢复后的通知撤回与未发出水量释放/转移。
 
 > 项目类型：**后端 API 服务**。自带 OpenAPI 3 文档与 Swagger UI，无独立前端页面。
 
@@ -104,8 +107,9 @@ BASE_URL=http://localhost:8080 python3 scripts/replay.py
 
 ```
 ##############################################################################
-# 回放断言结果：PASS=114  FAIL=0
-# 🎉 全部场景断言通过：同段重拨 / 相邻双支管 / 并发互斥 / 复压重派 / 更正链
+# 回放断言结果：PASS=158  FAIL=0
+# 🎉 全部场景断言通过：同段重拨 / 相邻双支管 / 并发互斥 / 复压重派 / 更正链 /
+#           临时供水去重 / 双路线配额 / 恢复撤回 / 签收不返库 / 退回复核 / 凭证有效期
 ALL_DONE: true
 ```
 
@@ -147,6 +151,22 @@ ALL_DONE: true
 10. **校时容差**：`POST /api/pressure/verify-repressure` 可分别判定
     “压力值超出支管区间”和“校时后采样时刻与复压时刻偏差超过容差”。
 11. 终态：所有 `resource_occupancy` 均为 `RELEASED`，3 个事故均 `CLOSED`。
+12. **住户去重与唯一取水点**：稳定标识 `residentCode` 全局唯一；甲区上报 180（140 独有 +
+    40 与乙重复）、乙区上报 130（90 独有 + 同 40 重复），重叠户主要住址在甲，
+    唯一服务归属为**甲 180、乙 90（合计 270，而非 310）**；每片区唯一取水点并保留
+    取水时段、无障碍接驳与罐容；人均 2 升 + 诊所 400 / 安置点 600，得甲 760、乙 780、合计 1540。
+13. **路线 A 按区预留（ZONE_RESERVED）**：派车前锁最低量（可再锁额外配额，护栏拒绝超额）；
+    乙区装车前恢复 → 待发 780 撤回并自动复核回补、旧通知 `SUPERSEDED` + 新发 `WITHDRAW`；
+    丙区新增 300 户（最低 600）→ 从乙可转移量转 600、释放 180 进共享池，
+    连同原共享池 460，终余自由水 **640**；甲 760 已签收不回退。
+14. **路线 B 共享池（SHARED_POOL）**：只锁各区最低量，其余 460 留共享池；乙恢复后 780 经
+    `SHARED_RELEASE` 回池（不产生片区配额转移），丙区凭恢复回执从共享池滚动分 600，
+    甲区 760 保障不变，终余同为 **640**；分配受“其他有效片区未覆盖最低量”护栏约束，
+    先到片区无法耗尽共享量。
+15. **库存与凭证闭环**：装车即锁水源写 `OUT` 台账并扣余量；现场签收计实交且**永不返库**；
+    已开封退回 422 拒绝，未开封退回挂 `PENDING`，复核 `APPROVED` 且凭证仍有效才写 `RETURN`
+    回补可再分配，`REJECTED` 不回补；水质凭证过期的 300 升既不计合格总量、也不能出库或借
+    退回补足；重复复核 409 拒绝。
 
 ---
 
@@ -207,7 +227,39 @@ curl -s $B/api/incidents/1 -H "$H" | python3 -m json.tool
 | 04 事故/方案/通知/复核 | `POST /api/incidents`、`/isolation-plans`、`/notify`、`/pressure-reviews`、`GET /{id}` |
 | 05 派工与互斥 | `/dispatch/scout`、`/dispatch/repair`、`/redispatch`、`/api/assignments/{id}/cancel|complete|issue` |
 | 06 回执与复压 | `POST /api/incidents/{id}/receipts`、`/close`、`POST /api/pressure/verify-repressure` |
+| 07 临时供水 | `/api/supply/residents`、`/supply/plans`、`/zones/{code}/restore`、`/quotas/transfer`、`/shared-allocations`、`/deliveries`、`/deliveries/{id}/signoffs|returns`、`/returns/{id}/review` |
 | 00 回放支持 | `POST /api/admin/reset` |
+
+### 临时供水核心接口速查
+
+```bash
+B=http://localhost:8080
+H="Authorization: Bearer $TOKEN"; J='Content-Type: application/json'
+
+# 去重名册：街道上报/唯一服务/重叠人数与各片区最低量
+curl -s $B/api/supply/residents -H "$H" | python3 -m json.tool
+
+# 两条路线二选一建立方案（同一时刻只允许一个 ACTIVE 方案）
+curl -s -X POST $B/api/supply/plans -H "$H" -H "$J" -d '{"mode":"ZONE_RESERVED"}'
+curl -s -X POST $B/api/supply/plans -H "$H" -H "$J" -d '{"mode":"SHARED_POOL"}'
+
+# 路线A：片区恢复 → 配额转移/释放；路线B：共享池滚动分配
+curl -s -X POST $B/api/supply/zones/Z_YI/restore -H "$H" -H "$J" -d '{"note":"乙区恢复"}'
+curl -s -X POST $B/api/supply/quotas/transfer -H "$H" -H "$J" \
+  -d '{"fromZone":"Z_YI","toZone":"Z_BING","litres":600}'
+curl -s -X POST $B/api/supply/shared-allocations -H "$H" -H "$J" \
+  -d '{"zoneCode":"Z_BING","litres":600}'
+
+# 装车（校验罐容/配额/凭证，扣水源余量）→ 现场签收 → 未开封退回复核
+curl -s -X POST $B/api/supply/deliveries -H "$H" -H "$J" -d '{
+  "zoneCode":"Z_JIA","vehicleCode":"WV-1","sourceCode":"WS-1","litres":760}'
+curl -s -X POST $B/api/supply/deliveries/1/signoffs -H "$H" -H "$J" -d '{
+  "litres":360,"residentCode":"R-JIA-ONLY-001","recipientType":"RESIDENT","signer":"网格员"}'
+curl -s -X POST $B/api/supply/deliveries/1/returns -H "$H" -H "$J" \
+  -d '{"litres":50,"sealed":true}'
+curl -s -X POST $B/api/supply/returns/1/review -H "$H" -H "$J" \
+  -d '{"approved":true,"note":"封条完好"}'
+```
 
 ---
 
@@ -265,6 +317,31 @@ NSRC ─ M0 ─ NT0 ─ F1 ─ NV1(V1) ─ F1D ─ NT1 ─ S1 ─ NE1   地址 A
   事故边界更新、地址集合 diff、阀门操作票“释放旧票/新占新票”（新票冲突则整体回滚）、
   旧通知 `SUPERSEDED` + 更正/取消通知链、`CorrectionRecord` 留全量快照。
 
+### 5.5 临时供水调度（`supply/`）
+
+- **稳定标识去重与唯一归属**：`ResidentRegistration.residentCode` 全局唯一，一户无论被多少
+  街道重复上报都只按 `primaryZoneCode`（主要住址）归属一个片区、计数一次；`reportedZoneCodes`
+  保留上报轨迹用于解释口径差。样例甲乙重叠 40 人主要住址在甲，故唯一服务为甲 180、乙 90。
+- **读取主任务停水地址集合**：`GET /api/supply/outage-links` 汇总各事故当前 ACTIVE 隔离方案
+  快照的 `affectedAddressCodes`（临时供水不自行估计范围），按片区 `segmentCode` 对齐到
+  片区与唯一取水点；多个方案覆盖同一支管时按地址去重，不重复计量。
+- **唯一取水点与服务要素**：每片区一个 `WaterPickupPoint`，携带取水时段、无障碍接驳、
+  接驳罐容；片区最低量 = 唯一服务人数 × 人均量 + 诊所/安置点设施量。
+- **两条配额路线**（`SupplyPlan.mode`，同时只允许一个 ACTIVE 方案）：
+  - `ZONE_RESERVED`：建方案即锁最低量，可经 `extra-reservations` 再锁额外配额；恢复片区
+    未发出的水成为 `transferableLitres`，经 `quotas/transfer` 转给新片区或
+    `release-transferable` 释放进共享池，每次变化写 `QuotaLedgerEvent`。
+  - `SHARED_POOL`：只锁各区最低量，其余合格水留共享池；恢复经 `SHARED_RELEASE` 回池，
+    新需求经 `shared-allocations` 滚动分配。护栏 `uncoveredMinimumSum` 保证分配后其余有效
+    片区最低量仍可满足，先到片区无法耗尽共享池。两路都不得突破仍有效片区的最低量。
+- **库存闭环**：`WaterSource.availableLitres` 仅在装车 `OUT` 与复核通过 `RETURN` 时变动，
+  全部留 `WaterSourceLedger`；装车校验车辆/取水点罐容、片区配额与水质凭证有效期；
+  `WaterSignoff` 计实交且永不返库；`WaterReturn` 必须未开封且复核 APPROVED 才回补；
+  凭证过期水源（`WS-EXP`）不计合格总量、不能出库、也不能借退回/库存总量补足。
+- **恢复不抹历史**：片区恢复撤回无签收发的在途车（自动复核回补）、配额释放/转移、
+  旧 `SupplyNotification` 置 `SUPERSEDED` 并新发 `WITHDRAW`（`replacesNotificationId` 链回），
+  已签收交付与历史台账原样保留，已恢复区域不再显示待配送。
+
 ---
 
 ## 6. 本地开发与验证方式（实际执行记录）
@@ -274,11 +351,11 @@ NSRC ─ M0 ─ NT0 ─ F1 ─ NV1(V1) ─ F1D ─ NT1 ─ S1 ─ NE1   地址 A
 | 验证 | 命令 | 实际结果 |
 | --- | --- | --- |
 | 编译 | `JAVA_HOME=/opt/jdk-25 /opt/maven/bin/mvn -s settings.xml compile` | BUILD SUCCESS |
-| 单元测试 | `... mvn -s settings.xml test` | `ImpactServiceTest` Tests run: 4, Failures: 0, Errors: 0 |
+| 单元测试 | `... mvn -s settings.xml test` | `ImpactServiceTest` 4 个 + `ResidentDedupServiceTest` 2 个，Tests run: 6, Failures: 0, Errors: 0 |
 | 打包 | `... mvn -s settings.xml -DskipTests package` | 生成 `target/water-repair-service.jar`（约 57 MB fat jar） |
-| 真实运行 | `/opt/jdk-25/bin/java -jar target/water-repair-service.jar` | 8080 启动成功，Hibernate 连 PostgreSQL 18.1 建表/播种，日志无 ERROR |
-| 端到端回放 | `python3 scripts/replay.py` | `PASS=114 FAIL=0`，并连续重复 4 次结果一致（含真实双线程并发派单） |
-| 接口文档 | `GET /v3/api-docs`、`/swagger-ui/index.html` | 均 200，OpenAPI 含全部 `/api/**` 路径 |
+| 真实运行 | `/opt/jdk-25/bin/java -jar target/water-repair-service.jar` | 8080 启动成功，Hibernate 连 PostgreSQL 18.1 建表/播种（含 570 户供水登记），日志无 ERROR |
+| 端到端回放 | `python3 scripts/replay.py` | `PASS=158 FAIL=0`，连续重复 3 次结果一致（含真实双线程并发派单与供水双路线重播） |
+| 接口文档 | `GET /v3/api-docs`、`/swagger-ui/index.html` | 均 200，OpenAPI 含全部 `/api/**` 路径（其中 `/api/supply/**` 20 个端点） |
 
 说明与限制（如实记录）：
 
@@ -294,7 +371,7 @@ NSRC ─ M0 ─ NT0 ─ F1 ─ NV1(V1) ─ F1D ─ NT1 ─ S1 ─ NE1   地址 A
 
 ```
 pom.xml / settings.xml / Dockerfile / docker-compose.yml
-scripts/replay.py                 # 114 断言的端到端回放（纯标准库）
+scripts/replay.py                 # 158 断言的端到端回放（纯标准库，含临时供水双路线）
 src/main/resources/application.yml
 src/main/resources/samples/       # 随题提供的管网/班组/账号/报修/回执样本
 src/main/java/com/waterrepair/
@@ -307,5 +384,7 @@ src/main/java/com/waterrepair/
   crew/        班组/车辆/工具/阀门操作许可
   dispatch/    派工单 + 资源占用 + 行锁互斥 + 资格校验
   receipt/     五类顺序回执 + 复压核验
+  supply/      临时供水：住户去重/片区取水点/水源凭证/双路线配额/派送签收退回/通知撤回
 src/test/java/com/waterrepair/network/ImpactServiceTest.java
+src/test/java/com/waterrepair/supply/ResidentDedupServiceTest.java
 ```

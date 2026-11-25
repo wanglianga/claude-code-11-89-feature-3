@@ -642,6 +642,264 @@ def main():
           len(incs) == 3 and all(i["status"] == "CLOSED" for i in incs),
           [(i["code"], i["status"]) for i in incs])
 
+    # ---------- 15. 临时供水：去重名册、唯一取水点与合格水源 ----------
+    section("15. 临时供水：稳定住户标识去重、唯一服务归属、取水点与合格水源")
+    st, doc = http("GET", "/v3/api-docs")
+    check("OpenAPI 含临时供水 /api/supply 接口",
+          st == 200 and "/api/supply/plans" in json.dumps(doc), st)
+    st, _ = http("POST", "/api/supply/plans", {"mode": "SHARED_POOL"}, token=viewer_token)
+    check("VIEWER 不能建立供水方案（403）", st == 403, f"status={st}")
+
+    _, roster = http("GET", "/api/supply/residents", token=disp, expect=200)
+    zmap = {z["zoneCode"]: z for z in roster["zones"]}
+    check("街道原始上报合计 310（甲180+乙130，含 40 重复）",
+          roster["reportedResidentTotal"] == 310, roster["reportedResidentTotal"])
+    check("唯一服务人数 270（甲180+乙90），40 重叠户只计一次；丙区初始未启用不入名册",
+          roster["uniqueResidentTotal"] == 270 and roster["overlapResidentTotal"] == 40,
+          (roster["uniqueResidentTotal"], roster["overlapResidentTotal"]))
+    check("甲区唯一归属 180 人、上报 180，最低 760（居民 360 + 诊所 400）",
+          zmap["Z_JIA"]["uniqueResidents"] == 180 and zmap["Z_JIA"]["reportedResidents"] == 180
+          and zmap["Z_JIA"]["residentMinimumLitres"] == 360.0
+          and zmap["Z_JIA"]["facilityMinimumLitres"] == 400.0
+          and zmap["Z_JIA"]["minimumLitres"] == 760.0, zmap["Z_JIA"])
+    check("乙区唯一归属 90 人而非上报 130，最低 780（居民 180 + 安置点 600）",
+          zmap["Z_YI"]["uniqueResidents"] == 90 and zmap["Z_YI"]["reportedResidents"] == 130
+          and zmap["Z_YI"]["minimumLitres"] == 780.0, zmap["Z_YI"])
+    check("丙区未恢复启用，不进入有效片区名册（300 户已登记但暂不计最低量）",
+          "Z_BING" not in zmap, list(zmap))
+    ovl = next(r for r in roster["residents"] if r["residentCode"] == "R-OVL-001")
+    check("重叠户稳定标识唯一，主要住址归属甲区，上报片区含甲乙",
+          ovl["primaryZoneCode"] == "Z_JIA"
+          and set(ovl["reportedZoneCodes"]) == {"Z_JIA", "Z_YI"}, ovl)
+    _, points = http("GET", "/api/supply/pickup-points", token=disp, expect=200)
+    pp = {p["zoneCode"]: p for p in points}
+    check("每片区唯一取水点，保留时段/无障碍/罐容（甲 PP-JIA 08:00-20:00 无障碍 1000L）",
+          pp["Z_JIA"]["code"] == "PP-JIA" and pp["Z_JIA"]["accessible"] is True
+          and pp["Z_JIA"]["openTime"] == "08:00" and pp["Z_JIA"]["tankCapacityLitres"] == 1000.0
+          and pp["Z_YI"]["code"] == "PP-YI", pp)
+    _, srcs = http("GET", "/api/supply/sources", token=disp, expect=200)
+    smap = {s["code"]: s for s in srcs}
+    check("合格水 WS-1 余量 2000 且凭证有效；WS-EXP 凭证过期、300 升不计合格、不能补足",
+          smap["WS-1"]["availableLitres"] == 2000.0 and smap["WS-1"]["qualityValid"] is True
+          and smap["WS-EXP"]["qualityValid"] is False and smap["WS-EXP"]["availableLitres"] == 300.0,
+          smap)
+    _, links = http("GET", "/api/supply/outage-links", token=disp, expect=200)
+    lz = {z["zoneCode"]: z for z in links["zones"]}
+    check("读取主任务 ACTIVE 隔离方案的停水地址集合：并集恰为 A01-A09（不自行估计范围）",
+          links["outageAddressCodes"] ==
+          [f"A0{i}" for i in range(1, 10)], links["outageAddressCodes"])
+    check("停水地址按支管映射到片区与唯一取水点：甲 S2=A01-A05/PP-JIA，乙 S3=A06-A09/PP-YI",
+          lz["Z_JIA"]["outageAddressCodes"] == [f"A0{i}" for i in range(1, 6)]
+          and lz["Z_JIA"]["pickupPoint"]["code"] == "PP-JIA"
+          and lz["Z_JIA"]["minimumLitres"] == 760.0
+          and lz["Z_YI"]["outageAddressCodes"] == [f"A0{i}" for i in range(6, 10)]
+          and lz["Z_YI"]["pickupPoint"]["code"] == "PP-YI"
+          and lz["Z_YI"]["minimumLitres"] == 780.0
+          and "Z_BING" not in lz, lz)
+
+    # ---------- 16. 路线A：按区预留，乙恢复→可转移→丙区 ----------
+    section("16. 路线A ZONE_RESERVED：锁最低量；乙恢复撤回，转移 600 给丙、释放 180，终余 640")
+    st, bad_mode = http("POST", "/api/supply/plans", {"mode": "WRONG"}, token=disp)
+    check("非法方案模式 400 拒绝", st == 400 and bad_mode["code"] == "UNKNOWN_SUPPLY_MODE", (st, bad_mode))
+    _, planA = http("POST", "/api/supply/plans", {"mode": "ZONE_RESERVED"},
+                    token=disp, expect=200)
+    planA_id = planA["id"]
+    check("方案A：合格总量 2000（过期 300 不计），最低合计 1540，共享池 460",
+          planA["qualifiedTotalLitres"] == 2000.0 and planA["sumMinimumLitres"] == 1540.0
+          and planA["sharedPoolLitres"] == 460.0, planA)
+    _, dA = http("GET", f"/api/supply/plans/{planA_id}", token=disp)
+    qA = {q["zoneCode"]: q for q in dA["quotas"]}
+    check("无额外配额时各片区预留=最低（甲 760、乙 780）",
+          qA["Z_JIA"]["reservedLitres"] == 760.0 and qA["Z_YI"]["reservedLitres"] == 780.0, qA)
+    st, guard = http("POST", "/api/supply/extra-reservations",
+                     {"zoneCode": "Z_JIA", "litres": 1000.0}, token=disp)
+    check("额外配额受共享池/最低量护栏约束，超额 422（防先到片区耗尽共享量）",
+          st == 422 and guard["code"] == "SHARED_POOL_INSUFFICIENT", (st, guard))
+    st, cap = http("POST", "/api/supply/deliveries",
+                   {"zoneCode": "Z_JIA", "vehicleCode": "WV-3", "sourceCode": "WS-1",
+                    "litres": 700.0}, token=disp)
+    check("装车超车辆罐容（WV-3 为 500L）422 拒绝",
+          st == 422 and cap["code"] == "TANK_CAPACITY_EXCEEDED", (st, cap))
+    st, expired = http("POST", "/api/supply/deliveries",
+                       {"zoneCode": "Z_JIA", "vehicleCode": "WV-1", "sourceCode": "WS-EXP",
+                        "litres": 100.0}, token=disp)
+    check("凭证过期水源不能出库（422），过期凭证不能由库存总量补足",
+          st == 422 and expired["code"] == "SOURCE_CERT_EXPIRED", (st, expired))
+
+    _, ldJia = http("POST", "/api/supply/deliveries",
+                    {"zoneCode": "Z_JIA", "vehicleCode": "WV-1", "sourceCode": "WS-1",
+                     "litres": 760.0}, token=disp, expect=200)
+    ldJia_id = ldJia["id"]
+    http("POST", f"/api/supply/deliveries/{ldJia_id}/signoffs",
+         {"litres": 360.0, "residentCode": "R-JIA-ONLY-001",
+          "recipientType": "RESIDENT", "signer": "甲区网格员"}, token=disp, expect=200)
+    st, cross = http("POST", f"/api/supply/deliveries/{ldJia_id}/signoffs",
+                     {"litres": 10.0, "residentCode": "R-YI-ONLY-001",
+                      "recipientType": "RESIDENT", "signer": "x"}, token=disp)
+    check("乙区住户不能在甲区派送单签收（唯一归属校验 422）",
+          st == 422 and cross["code"] == "RESIDENT_ZONE_MISMATCH", (st, cross))
+    _, so_fac = http("POST", f"/api/supply/deliveries/{ldJia_id}/signoffs",
+                     {"litres": 400.0, "recipientType": "FACILITY", "signer": "甲区诊所主任"},
+                     token=disp, expect=200)
+    check("甲区居民 360 + 诊所 400 共 760 现场签收，整车 DELIVERED，计入实交",
+          so_fac["litres"] == 400.0)
+
+    _, ldYi = http("POST", "/api/supply/deliveries",
+                   {"zoneCode": "Z_YI", "vehicleCode": "WV-2", "sourceCode": "WS-1",
+                    "litres": 780.0}, token=disp, expect=200)
+    ldYi_id = ldYi["id"]
+    _, zyi = http("POST", "/api/supply/zones/Z_YI/restore",
+                  {"note": "乙区抢修完成恢复供水"}, token=disp, expect=200)
+    check("乙区置为已恢复（active=false）", zyi["active"] is False)
+    _, dA2 = http("GET", f"/api/supply/plans/{planA_id}", token=disp)
+    qA2 = {q["zoneCode"]: q for q in dA2["quotas"]}
+    ldYi2 = next(d for d in dA2["deliveries"] if d["id"] == ldYi_id)
+    check("乙区在途 780 派送撤回 CANCELLED，未签收水自动复核回补水源",
+          ldYi2["status"] == "CANCELLED" and ldYi2["returnedLitres"] == 780.0, ldYi2)
+    check("乙配额 RELEASED，可转移量=预留780-签收0=780，已签收量为 0 不回退",
+          qA2["Z_YI"]["status"] == "RELEASED" and qA2["Z_YI"]["transferableLitres"] == 780.0
+          and qA2["Z_YI"]["deliveredLitres"] == 0.0, qA2["Z_YI"])
+    notesA = dA2["notifications"]
+    yi_old = [n for n in notesA if n["zoneCode"] == "Z_YI" and n["kind"] != "WITHDRAW"]
+    yi_withdraw = [n for n in notesA if n["zoneCode"] == "Z_YI" and n["kind"] == "WITHDRAW"]
+    check("乙区旧通知全 SUPERSEDED 并新发 WITHDRAW 链回旧通知，恢复区不再显示待配送",
+          yi_old and all(n["status"] == "SUPERSEDED" for n in yi_old)
+          and yi_withdraw and all(w["status"] == "SENT" and w["replacesNotificationId"]
+                                  for w in yi_withdraw),
+          [n["status"] for n in notesA if n["zoneCode"] == "Z_YI"])
+
+    http("POST", "/api/supply/zones/Z_BING/activate",
+         {"note": "丙区新增停水，300 独立住户"}, token=disp, expect=200)
+    _, tr = http("POST", "/api/supply/quotas/transfer",
+                 {"fromZone": "Z_YI", "toZone": "Z_BING", "litres": 600.0,
+                  "note": "丙区 300 人最低保障"}, token=disp, expect=200)
+    check("乙→丙转移 600（RESTORE_TRANSFER 留痕），乙可转移剩 180",
+          tr["eventType"] == "RESTORE_TRANSFER" and tr["zoneChangeLitres"] == 600.0
+          and tr["relatedZoneCode"] == "Z_YI", tr)
+    _, rel = http("POST", "/api/supply/quotas/release-transferable",
+                  {"zoneCode": "Z_YI", "litres": 180.0, "note": "剩余释放进共享池"},
+                  token=disp, expect=200)
+    check("乙剩余 180 释放进共享池（RESTORE_RELEASE，池 +180）",
+          rel["eventType"] == "RESTORE_RELEASE" and rel["poolChangeLitres"] == 180.0, rel)
+    _, ldBing = http("POST", "/api/supply/deliveries",
+                     {"zoneCode": "Z_BING", "vehicleCode": "WV-1", "sourceCode": "WS-1",
+                      "litres": 600.0}, token=disp, expect=200)
+    http("POST", f"/api/supply/deliveries/{ldBing['id']}/signoffs",
+         {"litres": 600.0, "residentCode": "R-BING-001",
+          "recipientType": "RESIDENT", "signer": "丙区网格员"}, token=disp, expect=200)
+    _, sumA = http("GET", "/api/supply/plans/active/summary", token=disp)
+    check("路线A终态：共享池=自由水 640（460+180），可转移 0，累计签收 1360（甲760+丙600）",
+          sumA["sharedPoolLitres"] == 640.0 and sumA["freeLitres"] == 640.0
+          and sumA["transferableLitres"] == 0.0 and sumA["deliveredLitres"] == 1360.0, sumA)
+    _, dA3 = http("GET", f"/api/supply/plans/{planA_id}", token=disp)
+    qA3 = {q["zoneCode"]: q for q in dA3["quotas"]}
+    check("丙区配额 600=300 人×2 升且已派送；乙区保持 RELEASED 不显示待配送",
+          qA3["Z_BING"]["reservedLitres"] == 600.0 and qA3["Z_BING"]["uniqueResidents"] == 300
+          and qA3["Z_BING"]["deliveredLitres"] == 600.0 and qA3["Z_YI"]["status"] == "RELEASED", qA3)
+    _, led = http("GET", "/api/supply/source-ledger", token=disp)
+    ws1 = [x for x in led if x["sourceCode"] == "WS-1"]
+    check("水源台账：3 次 OUT（甲760/乙780/丙600）+1 次 RETURN（乙撤回780），签收水无回补行",
+          [x["movementType"] for x in ws1].count("OUT") == 3
+          and [x["movementType"] for x in ws1].count("RETURN") == 1,
+          [x["movementType"] for x in ws1])
+    src_now = {s["code"]: s for s in (http("GET", "/api/supply/sources", token=disp)[1])}
+    check("WS-1 余量=2000-760-780+780-600=640；签收 1360 永不返库，WS-EXP 仍 300 不动",
+          src_now["WS-1"]["availableLitres"] == 640.0 and src_now["WS-EXP"]["availableLitres"] == 300.0,
+          src_now)
+
+    # ---------- 17. 路线B：共享池滚动派送，乙恢复回池、丙滚动分配 ----------
+    section("17. 路线B SHARED_POOL：只锁最低量；乙恢复 780 回池，丙滚动分 600，终余 640 且无配额转移")
+    http("POST", "/api/admin/reset", {}, token=disp, expect=200)
+    _, roster2 = http("GET", "/api/supply/residents", token=disp)
+    check("reset 后去重口径不变（270 唯一 / 310 上报 / 40 重叠）",
+          roster2["uniqueResidentTotal"] == 270 and roster2["reportedResidentTotal"] == 310)
+    _, planB = http("POST", "/api/supply/plans", {"mode": "SHARED_POOL"}, token=disp, expect=200)
+    planB_id = planB["id"]
+    check("方案B：只锁最低 1540，共享池 460，无片区额外配额",
+          planB["mode"] == "SHARED_POOL" and planB["sumMinimumLitres"] == 1540.0
+          and planB["sharedPoolLitres"] == 460.0, planB)
+    _, dB = http("GET", f"/api/supply/plans/{planB_id}", token=disp)
+    qB = {q["zoneCode"]: q for q in dB["quotas"]}
+    check("甲乙各只锁最低（甲760/乙780）",
+          qB["Z_JIA"]["reservedLitres"] == 760.0 and qB["Z_YI"]["reservedLitres"] == 780.0)
+    st, guardB = http("POST", "/api/supply/shared-allocations",
+                      {"zoneCode": "Z_JIA", "litres": 1000.0}, token=disp)
+    check("共享池分配超池 422 拒绝，防止先到片区耗尽共享量",
+          st == 422 and guardB["code"] == "SHARED_POOL_INSUFFICIENT", (st, guardB))
+    http("POST", "/api/supply/zones/Z_YI/restore", {"note": "乙区装车前确认恢复"},
+         token=disp, expect=200)
+    _, dB2 = http("GET", f"/api/supply/plans/{planB_id}", token=disp)
+    qB2 = {q["zoneCode"]: q for q in dB2["quotas"]}
+    ev_yi = [e for e in dB2["quotaLedger"] if e["zoneCode"] == "Z_YI"]
+    check("路线B乙恢复：RELEASED 且可转移 0，780 经 SHARED_RELEASE 回共享池（不是配额转移）",
+          qB2["Z_YI"]["status"] == "RELEASED" and qB2["Z_YI"]["transferableLitres"] == 0.0
+          and any(e["eventType"] == "SHARED_RELEASE" and e["poolChangeLitres"] == 780.0 for e in ev_yi)
+          and not any(e["eventType"] == "RESTORE_TRANSFER" for e in dB2["quotaLedger"]), qB2["Z_YI"])
+    _, sumB1 = http("GET", "/api/supply/plans/active/summary", token=disp)
+    check("乙恢复后共享池=460+780=1240，甲区 760 保障不变",
+          sumB1["sharedPoolLitres"] == 1240.0, sumB1)
+    http("POST", "/api/supply/zones/Z_BING/activate", {"note": "丙区新增 300 户"},
+         token=disp, expect=200)
+    _, allocC = http("POST", "/api/supply/shared-allocations",
+                     {"zoneCode": "Z_BING", "litres": 600.0, "note": "丙区最低保障滚动派送"},
+                     token=disp, expect=200)
+    check("丙区从共享池滚动分配 600（SHARED_ALLOC，无乙区配额转移），池降到 640",
+          allocC["eventType"] == "SHARED_ALLOC" and allocC["zoneCode"] == "Z_BING"
+          and allocC["poolAfterLitres"] == 640.0, allocC)
+    _, ldC = http("POST", "/api/supply/deliveries",
+                  {"zoneCode": "Z_BING", "vehicleCode": "WV-1", "sourceCode": "WS-1",
+                   "litres": 600.0}, token=disp, expect=200)
+    http("POST", f"/api/supply/deliveries/{ldC['id']}/signoffs",
+         {"litres": 600.0, "residentCode": "R-BING-002",
+          "recipientType": "RESIDENT", "signer": "丙区网格员"}, token=disp, expect=200)
+    _, sumB2 = http("GET", "/api/supply/plans/active/summary", token=disp)
+    check("路线B终态：共享池=自由水 640、可转移 0、丙已签收 600、甲 760 保障不变",
+          sumB2["sharedPoolLitres"] == 640.0 and sumB2["freeLitres"] == 640.0
+          and sumB2["transferableLitres"] == 0.0 and sumB2["deliveredLitres"] == 600.0, sumB2)
+
+    # ---------- 18. 签收不返库、未开封退回复核、过期凭证 ----------
+    section("18. 现场规则：签收不返库、已开封拒退、复核通过才回补、驳回与过期不补足")
+    _, ldJ = http("POST", "/api/supply/deliveries",
+                  {"zoneCode": "Z_JIA", "vehicleCode": "WV-3", "sourceCode": "WS-1",
+                   "litres": 200.0}, token=disp, expect=200)
+    ldJ_id = ldJ["id"]
+    http("POST", f"/api/supply/deliveries/{ldJ_id}/signoffs",
+         {"litres": 50.0, "residentCode": "R-JIA-ONLY-002",
+          "recipientType": "RESIDENT", "signer": "甲区网格员"}, token=disp, expect=200)
+    st, opened = http("POST", f"/api/supply/deliveries/{ldJ_id}/returns",
+                      {"litres": 100.0, "sealed": False}, token=disp)
+    check("已开封退回 422 拒绝（不得再分配）",
+          st == 422 and opened["code"] == "RETURN_NOT_SEALED", (st, opened))
+    _, ret1 = http("POST", f"/api/supply/deliveries/{ldJ_id}/returns",
+                   {"litres": 100.0, "sealed": True, "note": "整箱未用"}, token=disp, expect=200)
+    check("未开封退回挂 PENDING 复核", ret1["reviewStatus"] == "PENDING", ret1)
+    src_before = {s["code"]: s for s in (http("GET", "/api/supply/sources", token=disp)[1])}
+    bal_before = src_before["WS-1"]["availableLitres"]
+    _, rev_rej = http("POST", f"/api/supply/returns/{ret1['id']}/review",
+                      {"approved": False, "note": "外包装破损，驳回"}, token=disp, expect=200)
+    src_mid = {s["code"]: s for s in (http("GET", "/api/supply/sources", token=disp)[1])}
+    check("复核驳回 REJECTED 不回补，水源余量不变",
+          rev_rej["reviewStatus"] == "REJECTED"
+          and src_mid["WS-1"]["availableLitres"] == bal_before,
+          (bal_before, src_mid["WS-1"]["availableLitres"]))
+    _, ret2 = http("POST", f"/api/supply/deliveries/{ldJ_id}/returns",
+                   {"litres": 50.0, "sealed": True}, token=disp, expect=200)
+    _, rev_ok = http("POST", f"/api/supply/returns/{ret2['id']}/review",
+                     {"approved": True, "note": "封条完好，同意回补"}, token=disp, expect=200)
+    src_after = {s["code"]: s for s in (http("GET", "/api/supply/sources", token=disp)[1])}
+    check("复核通过 APPROVED 才回补 50 升（RETURN 台账），可再分配",
+          rev_ok["reviewStatus"] == "APPROVED" and rev_ok["ledgerId"] is not None
+          and src_after["WS-1"]["availableLitres"] == bal_before + 50.0,
+          (bal_before, src_after["WS-1"]["availableLitres"]))
+    _, detailJ = http("GET", f"/api/supply/deliveries/{ldJ_id}", token=disp)
+    check("签收 50 升保留为实交不返库；驳回 100 留车、通过 50 已回补",
+          sum(s["litres"] for s in detailJ["signoffs"]) == 50.0
+          and [r["reviewStatus"] for r in detailJ["returns"]] == ["REJECTED", "APPROVED"], detailJ)
+    st, re_review = http("POST", f"/api/supply/returns/{ret2['id']}/review",
+                         {"approved": True}, token=disp)
+    check("退回重复复核 409 拒绝（台账不可重复回补）",
+          st == 409 and re_review["code"] == "RETURN_ALREADY_REVIEWED", (st, re_review))
+
     print("\n" + "#" * 78)
     print(f"# 回放断言结果：PASS={PASS_COUNT}  FAIL={FAIL_COUNT}")
     if FAIL_COUNT:
@@ -650,7 +908,8 @@ def main():
             print("  - " + line)
         print("ALL_DONE: false")
         sys.exit(1)
-    print("# 🎉 全部场景断言通过：同段重拨 / 相邻双支管 / 并发互斥 / 复压重派 / 更正链")
+    print("# 🎉 全部场景断言通过：同段重拨 / 相邻双支管 / 并发互斥 / 复压重派 / 更正链 /")
+    print("#           临时供水去重 / 双路线配额 / 恢复撤回 / 签收不返库 / 退回复核 / 凭证有效期")
     print("ALL_DONE: true")
     sys.exit(0)
 

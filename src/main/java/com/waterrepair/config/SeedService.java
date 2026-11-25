@@ -26,6 +26,16 @@ import com.waterrepair.network.PressureReading;
 import com.waterrepair.network.PressureReadingRepository;
 import com.waterrepair.network.ValveSpec;
 import com.waterrepair.network.ValveSpecRepository;
+import com.waterrepair.supply.ResidentRegistration;
+import com.waterrepair.supply.ResidentRegistrationRepository;
+import com.waterrepair.supply.SupplyZone;
+import com.waterrepair.supply.SupplyZoneRepository;
+import com.waterrepair.supply.WaterPickupPoint;
+import com.waterrepair.supply.WaterPickupPointRepository;
+import com.waterrepair.supply.WaterSource;
+import com.waterrepair.supply.WaterSourceRepository;
+import com.waterrepair.supply.WaterVehicle;
+import com.waterrepair.supply.WaterVehicleRepository;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -33,6 +43,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.io.InputStream;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,6 +69,11 @@ public class SeedService {
     private final VehicleRepository vehicleRepo;
     private final ToolItemRepository toolRepo;
     private final OperationPermitRepository permitRepo;
+    private final SupplyZoneRepository supplyZoneRepo;
+    private final WaterPickupPointRepository pickupPointRepo;
+    private final WaterSourceRepository waterSourceRepo;
+    private final WaterVehicleRepository waterVehicleRepo;
+    private final ResidentRegistrationRepository residentRepo;
 
     public SeedService(ObjectMapper objectMapper, JdbcTemplate jdbcTemplate, AuthService authService,
                        UserAccountRepository userRepo, NetworkNodeRepository nodeRepo,
@@ -65,7 +81,12 @@ public class SeedService {
                        AddressPointRepository addressRepo, GeoLandmarkRepository landmarkRepo,
                        PressureDeviceRepository deviceRepo, PressureReadingRepository readingRepo,
                        CrewRepository crewRepo, VehicleRepository vehicleRepo,
-                       ToolItemRepository toolRepo, OperationPermitRepository permitRepo) {
+                       ToolItemRepository toolRepo, OperationPermitRepository permitRepo,
+                       SupplyZoneRepository supplyZoneRepo,
+                       WaterPickupPointRepository pickupPointRepo,
+                       WaterSourceRepository waterSourceRepo,
+                       WaterVehicleRepository waterVehicleRepo,
+                       ResidentRegistrationRepository residentRepo) {
         this.objectMapper = objectMapper;
         this.jdbcTemplate = jdbcTemplate;
         this.authService = authService;
@@ -81,6 +102,11 @@ public class SeedService {
         this.vehicleRepo = vehicleRepo;
         this.toolRepo = toolRepo;
         this.permitRepo = permitRepo;
+        this.supplyZoneRepo = supplyZoneRepo;
+        this.pickupPointRepo = pickupPointRepo;
+        this.waterSourceRepo = waterSourceRepo;
+        this.waterVehicleRepo = waterVehicleRepo;
+        this.residentRepo = residentRepo;
     }
 
     @Transactional
@@ -158,6 +184,42 @@ public class SeedService {
             userRepo.save(new UserAccount(a.username(), authService.encode(a.password()),
                     a.displayName(), a.role(), a.crewCode()));
         }
+
+        seedSupply();
+    }
+
+    private void seedSupply() {
+        SeedDtos.SupplySeed supply = readJson("samples/supply.json", SeedDtos.SupplySeed.class);
+        OffsetDateTime now = OffsetDateTime.now();
+        for (SeedDtos.SupplyZoneDto z : supply.zones()) {
+            SupplyZone zone = new SupplyZone(z.code(), z.name(), z.residentQuotaLitres(),
+                    z.facilityMinimumLitres(), z.facilityName());
+            zone.setSegmentCode(z.segmentCode());
+            if (Boolean.FALSE.equals(z.active())) {
+                zone.setActive(false);
+            }
+            supplyZoneRepo.save(zone);
+        }
+        for (SeedDtos.PickupPointDto p : supply.pickupPoints()) {
+            pickupPointRepo.save(new WaterPickupPoint(p.code(), p.zoneCode(), p.name(),
+                    p.openTime(), p.closeTime(), p.accessible(), p.tankCapacityLitres(), now));
+        }
+        for (SeedDtos.WaterSourceDto s : supply.sources()) {
+            waterSourceRepo.save(new WaterSource(s.code(), s.name(), s.totalCapacityLitres(),
+                    s.qualityCertNo(), s.qualityExpiresAt(), now));
+        }
+        for (SeedDtos.WaterVehicleDto v : supply.vehicles()) {
+            waterVehicleRepo.save(new WaterVehicle(v.code(), v.name(), v.plateNo(),
+                    v.tankCapacityLitres(), !Boolean.FALSE.equals(v.available()), null));
+        }
+        for (SeedDtos.ResidentBulkDto r : supply.residents()) {
+            for (int i = 1; i <= r.bulkCount(); i++) {
+                String code = String.format("%s-%03d", r.residentCodePrefix(), i);
+                String name = String.format("%s%03d", r.householdNamePrefix(), i);
+                residentRepo.save(new ResidentRegistration(code, name, r.primaryZoneCode(),
+                        r.headcount(), r.reportedZoneCodes(), r.barrierFreeNeeded(), now));
+            }
+        }
     }
 
     private <T> T readJson(String path, Class<T> type) {
@@ -183,6 +245,11 @@ public class SeedService {
         m.put("vehicles", vehicleRepo.count());
         m.put("tools", toolRepo.count());
         m.put("permits", permitRepo.count());
+        m.put("supplyZones", supplyZoneRepo.count());
+        m.put("pickupPoints", pickupPointRepo.count());
+        m.put("waterSources", waterSourceRepo.count());
+        m.put("waterVehicles", waterVehicleRepo.count());
+        m.put("residents", residentRepo.count());
         return m;
     }
 }

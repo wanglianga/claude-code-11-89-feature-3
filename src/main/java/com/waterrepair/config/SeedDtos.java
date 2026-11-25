@@ -71,4 +71,36 @@ public final class SeedDtos {
     public record AccountDto(String username, String password, String displayName,
                              String role, String crewCode) {
     }
+
+    public record SupplySeed(List<SupplyZoneDto> zones,
+                             List<PickupPointDto> pickupPoints,
+                             List<WaterSourceDto> sources,
+                             List<WaterVehicleDto> vehicles,
+                             List<ResidentBulkDto> residents) {
+    }
+
+    public record SupplyZoneDto(String code, String name, double residentQuotaLitres,
+                                double facilityMinimumLitres, String facilityName,
+                                String segmentCode, Boolean active) {
+    }
+
+    public record PickupPointDto(String code, String zoneCode, String name,
+                                 String openTime, String closeTime,
+                                 boolean accessible, double tankCapacityLitres) {
+    }
+
+    public record WaterSourceDto(String code, String name, double totalCapacityLitres,
+                                 String qualityCertNo, OffsetDateTime qualityExpiresAt) {
+    }
+
+    public record WaterVehicleDto(String code, String name, String plateNo,
+                                  double tankCapacityLitres, Boolean available) {
+    }
+
+    /** 批量住户：bulkCount 户共享同一登记口径，逐户生成稳定标识 prefix-001…。 */
+    public record ResidentBulkDto(String residentCodePrefix, int bulkCount,
+                                  String householdNamePrefix, int headcount,
+                                  String primaryZoneCode, List<String> reportedZoneCodes,
+                                  boolean barrierFreeNeeded) {
+    }
 }

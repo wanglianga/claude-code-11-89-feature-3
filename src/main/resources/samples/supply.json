@@ -1,0 +1,136 @@
+{
+  "zones": [
+    {
+      "code": "Z_JIA",
+      "name": "甲区（幸福路片）",
+      "residentQuotaLitres": 2.0,
+      "facilityMinimumLitres": 400.0,
+      "facilityName": "甲区社区诊所",
+      "segmentCode": "S2",
+      "active": true
+    },
+    {
+      "code": "Z_YI",
+      "name": "乙区（滨河巷片）",
+      "residentQuotaLitres": 2.0,
+      "facilityMinimumLitres": 600.0,
+      "facilityName": "乙区临时安置点",
+      "segmentCode": "S3",
+      "active": true
+    },
+    {
+      "code": "Z_BING",
+      "name": "丙区（新设停水片）",
+      "residentQuotaLitres": 2.0,
+      "facilityMinimumLitres": 0.0,
+      "facilityName": null,
+      "active": false
+    }
+  ],
+  "pickupPoints": [
+    {
+      "code": "PP-JIA",
+      "zoneCode": "Z_JIA",
+      "name": "甲区文化站取水点",
+      "openTime": "08:00",
+      "closeTime": "20:00",
+      "accessible": true,
+      "tankCapacityLitres": 1000.0
+    },
+    {
+      "code": "PP-YI",
+      "zoneCode": "Z_YI",
+      "name": "乙区滨河广场取水点",
+      "openTime": "08:30",
+      "closeTime": "19:30",
+      "accessible": false,
+      "tankCapacityLitres": 800.0
+    },
+    {
+      "code": "PP-BING",
+      "zoneCode": "Z_BING",
+      "name": "丙区体育中心取水点",
+      "openTime": "09:00",
+      "closeTime": "21:00",
+      "accessible": true,
+      "tankCapacityLitres": 1000.0
+    }
+  ],
+  "sources": [
+    {
+      "code": "WS-1",
+      "name": "市政合格水源一号",
+      "totalCapacityLitres": 2000.0,
+      "qualityCertNo": "QC-2026-1101",
+      "qualityExpiresAt": "2026-12-31T23:59:59+08:00"
+    },
+    {
+      "code": "WS-EXP",
+      "name": "凭证到期水源（只读，不得出库）",
+      "totalCapacityLitres": 300.0,
+      "qualityCertNo": "QC-2026-0901-EXPIRED",
+      "qualityExpiresAt": "2026-11-01T00:00:00+08:00"
+    }
+  ],
+  "vehicles": [
+    {
+      "code": "WV-1",
+      "name": "供水罐车一号",
+      "plateNo": "鄂A·W0001",
+      "tankCapacityLitres": 1000.0,
+      "available": true
+    },
+    {
+      "code": "WV-2",
+      "name": "供水罐车二号",
+      "plateNo": "鄂A·W0002",
+      "tankCapacityLitres": 800.0,
+      "available": true
+    },
+    {
+      "code": "WV-3",
+      "name": "供水罐车三号",
+      "plateNo": "鄂A·W0003",
+      "tankCapacityLitres": 500.0,
+      "available": true
+    }
+  ],
+  "residents": [
+    {
+      "residentCodePrefix": "R-JIA-ONLY",
+      "bulkCount": 140,
+      "householdNamePrefix": "甲区独有住户",
+      "headcount": 1,
+      "primaryZoneCode": "Z_JIA",
+      "reportedZoneCodes": ["Z_JIA"],
+      "barrierFreeNeeded": false
+    },
+    {
+      "residentCodePrefix": "R-OVL",
+      "bulkCount": 40,
+      "householdNamePrefix": "甲乙重叠住户（主要住址甲区）",
+      "headcount": 1,
+      "primaryZoneCode": "Z_JIA",
+      "reportedZoneCodes": ["Z_JIA", "Z_YI"],
+      "barrierFreeNeeded": true
+    },
+    {
+      "residentCodePrefix": "R-YI-ONLY",
+      "bulkCount": 90,
+      "householdNamePrefix": "乙区独有住户",
+      "headcount": 1,
+      "primaryZoneCode": "Z_YI",
+      "reportedZoneCodes": ["Z_YI"],
+      "barrierFreeNeeded": false
+    },
+    {
+      "residentCodePrefix": "R-BING",
+      "bulkCount": 300,
+      "householdNamePrefix": "丙区独立住户",
+      "headcount": 1,
+      "primaryZoneCode": "Z_BING",
+      "reportedZoneCodes": ["Z_BING"],
+      "barrierFreeNeeded": false
+    }
+  ]
+}
